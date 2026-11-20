@@ -1,0 +1,299 @@
+# ============================================================================
+# KrishiBondhu Bangladesh — OTP Service (Secure)
+# HMAC-hashed storage, attempt limits, single-use, SMS simulator support
+# ============================================================================
+
+import asyncio
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+import logging
+import threading
+import time
+import uuid
+
+from fastapi import HTTPException
+from jose import JWTError, jwt
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import get_settings
+from app.core.exceptions import InvalidOtpError, OtpExpiredError
+from app.core.security import generate_numeric_otp, hmac_hash_otp, hmac_verify_otp, normalize_bd_phone
+from app.repositories.auth import AuthRepository
+from app.services.supabase_client import supabase_client
+
+logger = logging.getLogger("krishibondhu.otp")
+settings = get_settings()
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _safe_create_task(coro) -> asyncio.Task:
+    """Retain strong reference to prevent premature garbage collection and unhandled task warnings."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def _done_callback(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        try:
+            if not t.cancelled() and t.exception():
+                logger.warning(f"Background task exception: {t.exception()}")
+        except Exception:
+            pass
+
+    task.add_done_callback(_done_callback)
+    return task
+
+
+class SmsSimulatorInbox:
+    """Thread-safe in-memory store for SMS simulator messages."""
+
+    def __init__(self, ttl_seconds: int = 300):
+        self._store: dict[str, list[dict]] = defaultdict(list)
+        self._lock = threading.Lock()
+        self._ttl = ttl_seconds
+
+    def put(self, phone: str, message: str, otp_code: str = "") -> None:
+        with self._lock:
+            self._cleanup()
+            self._store[phone].append({"message": message, "otp_code": otp_code, "created_at": time.time()})
+
+    def get_and_delete(self, phone: str) -> list[dict]:
+        with self._lock:
+            self._cleanup()
+            return self._store.pop(phone, [])
+
+    def _cleanup(self) -> None:
+        cutoff = time.time() - self._ttl
+        for phone in list(self._store):
+            self._store[phone] = [m for m in self._store[phone] if m["created_at"] > cutoff]
+            if not self._store[phone]:
+                del self._store[phone]
+
+
+class IpRateLimiter:
+    """Simple in-memory per-IP rate limiter with cleanup to prevent memory leaks."""
+
+    def __init__(self):
+        self._store: dict[str, list[float]] = defaultdict(list)
+        self._lock = threading.Lock()
+
+    def check_and_record(self, ip: str, max_count: int, window_minutes: int) -> bool:
+        now, cutoff = time.time(), time.time() - (window_minutes * 60)
+        with self._lock:
+            active_timestamps = [t for t in self._store[ip] if t > cutoff]
+            if not active_timestamps:
+                self._store.pop(ip, None)
+            else:
+                self._store[ip] = active_timestamps
+
+            if len(self._store.get(ip, [])) >= max_count:
+                return False
+
+            if ip not in self._store:
+                self._store[ip] = []
+            self._store[ip].append(now)
+
+            # Periodic cleanup of whole store if size exceeds threshold (Bug 4.2)
+            if len(self._store) > 1000:
+                for k in list(self._store.keys()):
+                    self._store[k] = [t for t in self._store[k] if t > cutoff]
+                    if not self._store[k]:
+                        self._store.pop(k, None)
+
+            return True
+
+
+sms_inbox = SmsSimulatorInbox()
+ip_rate_limiter = IpRateLimiter()
+phone_rate_limiter = IpRateLimiter()
+
+_consumed_verification_tokens: set[str] = set()
+
+
+class OtpService:
+    """Handles OTP generation, HMAC hashing, SMS dispatch, and verification."""
+
+    def __init__(self, db: AsyncSession):
+        self.db = db
+        self.repo = AuthRepository(db)
+
+    def _generate_verification_token(
+        self, phone: str, purpose: str, otp_id: str | None = None, **kwargs
+    ) -> str:
+        phone_norm = normalize_bd_phone(phone)
+        now = datetime.now(timezone.utc)
+        payload = {
+            "sub": phone_norm,
+            "phone": phone_norm,
+            "purpose": purpose,
+            "type": "phone_verification",
+            "jti": str(uuid.uuid4()),
+            "iat": now,
+            "exp": now + timedelta(minutes=10),
+        }
+        if otp_id:
+            payload["otp_id"] = str(otp_id)
+        return jwt.encode(
+            payload,
+            settings.jwt_secret_key,
+            algorithm=settings.jwt_algorithm,
+        )
+
+    def consume_verification_token(self, token: str) -> None:
+        """Mark token as consumed in DB and memory to prevent replay attacks (Bug 2.1 & Bug 04)."""
+        try:
+            payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+            jti = payload.get("jti")
+            if jti:
+                _consumed_verification_tokens.add(jti)
+            otp_id = payload.get("otp_id")
+            if otp_id:
+                _consumed_verification_tokens.add(otp_id)
+                # Fire and forget task to mark OTP record consumed in DB
+                _safe_create_task(self.repo.mark_otp_consumed(uuid.UUID(otp_id)))
+        except Exception:
+            pass
+        _consumed_verification_tokens.add(token)
+
+    def decode_verification_token(self, token: str, expected_phone: str, expected_purpose: str) -> bool:
+        if token in _consumed_verification_tokens:
+            return False
+        try:
+            payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+            jti = payload.get("jti")
+            if jti and jti in _consumed_verification_tokens:
+                return False
+            otp_id = payload.get("otp_id")
+            if otp_id and otp_id in _consumed_verification_tokens:
+                return False
+
+            return (
+                (payload.get("phone") or payload.get("sub")) == normalize_bd_phone(expected_phone)
+                and payload.get("purpose") == expected_purpose
+                and payload.get("type") == "phone_verification"
+            )
+        except (JWTError, ValueError):
+            return False
+
+    def _raise_rate_limit(self, target: str) -> None:
+        win = settings.otp_rate_limit_window_minutes
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many OTP requests for this {target}. Try again after {win} minutes (নতুন OTP চাওয়ার সীমা অতিক্রম হয়েছে).",
+            headers={"Retry-After": str(win * 60)},
+        )
+
+    async def send_otp(self, phone_number: str, purpose: str = "registration", ip_address: str | None = None) -> dict:
+        phone = normalize_bd_phone(phone_number)
+        win = settings.otp_rate_limit_window_minutes
+
+        # Rate limit: max 5 requests per hour (per phone) across login, registration, password reset
+        max_phone_attempts = settings.otp_rate_limit_per_phone
+        max_ip_attempts = settings.otp_rate_limit_per_ip if not settings.otp_demo_mode else 50
+
+        # Check recent OTP generation count in database across all purposes
+        db_count = 0
+        try:
+            db_count = await self.repo.count_recent_otps_for_phone(phone, window_minutes=win)
+        except Exception:
+            pass
+
+        if db_count >= max_phone_attempts or not phone_rate_limiter.check_and_record(phone, max_phone_attempts, win):
+            self._raise_rate_limit("phone")
+
+        if ip_address and not ip_rate_limiter.check_and_record(ip_address, max_ip_attempts, win):
+            self._raise_rate_limit("IP")
+
+        otp_code = settings.otp_demo_code if settings.otp_demo_mode else generate_numeric_otp(settings.otp_length)
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.otp_expire_minutes)
+        otp_hash = hmac_hash_otp(otp_code, settings.otp_hmac_secret)
+
+        await self.repo.create_otp(phone_number=phone, otp_hash=otp_hash, purpose=purpose, expires_at=expires_at)
+        self._dispatch_sms(phone, otp_code, purpose)
+        _safe_create_task(supabase_client.record_otp(phone, otp_hash, expires_at))
+
+        res = {
+            "message": f"OTP sent to {phone_number} successfully.",
+            "phone_number": phone_number,
+            "purpose": purpose,
+            "expires_in_seconds": settings.otp_expire_minutes * 60,
+            "resend_after": 60,
+        }
+        if settings.otp_demo_mode:
+            res["demo_mode"] = True
+        return res
+
+    def _dispatch_sms(self, phone: str, otp_code: str, purpose: str) -> None:
+        msg = f"[কৃষিবন্ধু] আপনার ওটিপি কোড হলো: {otp_code}। মেয়াদ {settings.otp_expire_minutes} মিনিট।"
+        # Always log OTP in console for easy development/testing without any external demo endpoints
+        if settings.sms_mode == "simulator" or settings.environment.lower() != "production":
+            sms_inbox.put(phone, msg, otp_code=otp_code)
+
+    async def verify_otp(self, phone_number: str, otp_code: str, purpose: str = "registration") -> dict:
+        phone = normalize_bd_phone(phone_number)
+        record = await self.repo.get_latest_otp(phone_number=phone, purpose=purpose, for_update=True)
+
+        if not record:
+            raise InvalidOtpError("No pending OTP found for this number. Please request a new OTP (নতুন OTP চান).")
+        if record.expires_at < datetime.now(timezone.utc):
+            raise OtpExpiredError("OTP code has expired. Please request a new one (নতুন OTP চান).")
+        if record.is_used:
+            raise InvalidOtpError("This OTP has already been used or invalidated. Please request a new one (নতুন OTP চান).")
+
+        # —— Strict Lockout ———————————————————————————————————————
+        # Once an OTP reaches 5 failed attempts (verify_attempts >= max_attempts),
+        # it is permanently invalidated. Even if the user enters the CORRECT OTP
+        # on attempt 6+, it must return 400 (InvalidOtpError) and never succeed (200).
+        if record.verify_attempts >= settings.otp_max_verify_attempts:
+            await self.repo.mark_otp_consumed(record.id)
+            raise InvalidOtpError(
+                "Too many incorrect attempts. This OTP has been permanently invalidated. "
+                "Please request a new OTP (নতুন OTP চান)."
+            )
+
+        # —— Code Verification ——————————————————————————————————————
+        # Demo mode: the fixed demo code always passes, but wrong demo codes
+        # still consume attempts (no free-pass for guessing non-demo codes).
+        otp_stripped = (otp_code or "").strip()
+        is_demo_match = settings.otp_demo_mode and (otp_stripped == settings.otp_demo_code)
+        code_correct = is_demo_match or hmac_verify_otp(otp_stripped, record.otp_hash, settings.otp_hmac_secret)
+
+        if not code_correct:
+            await self.repo.increment_otp_attempts(record.id)
+            new_attempts = record.verify_attempts + 1
+            remaining = settings.otp_max_verify_attempts - new_attempts
+
+            if remaining <= 0:
+                # Final wrong attempt: permanently burn the OTP so any concurrent
+                # or subsequent attempts (even correct code) are blocked.
+                await self.repo.mark_otp_consumed(record.id)
+                raise InvalidOtpError(
+                    "Too many incorrect attempts. This OTP has been permanently invalidated. "
+                    "Please request a new OTP (নতুন OTP চান)."
+                )
+            raise InvalidOtpError(f"Incorrect OTP code. {remaining} attempt(s) remaining.")
+
+        await self.repo.mark_otp_verified(record.id)
+        _safe_create_task(supabase_client.mark_otp_verified(phone, record.otp_hash))
+
+        return {
+            "message": "OTP verified successfully.",
+            "phone_number": phone,
+            "is_verified": True,
+            "verification_token": self._generate_verification_token(phone, purpose, otp_id=str(record.id)),
+        }
+
+    async def is_verified(
+        self, phone_number: str, purpose: str, otp_code: str | None = None, verification_token: str | None = None
+    ) -> bool:
+        phone = normalize_bd_phone(phone_number)
+        if verification_token and self.decode_verification_token(verification_token, phone, purpose):
+            return True
+        if await self.repo.is_phone_verified_recently(phone, purpose, within_minutes=15):
+            return True
+        if otp_code:
+            try:
+                return (await self.verify_otp(phone, otp_code, purpose)).get("is_verified", False)
+            except Exception:
+                return False
+        return False

@@ -1,0 +1,43 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Demo frontend build & dependencies
+demo/node_modules/
+demo/.next/
+demo/.env*.local
+demo/*.tsbuildinfo
+
+uploads/
+
+docs
+
+
+.env
+*.log
+__pycache__/
+venv312/
+.pytest_cache/
+*.zip
+*.patch
+.agents
+Gravitas

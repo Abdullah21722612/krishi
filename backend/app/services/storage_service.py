@@ -1,0 +1,261 @@
+"""
+services/storage_service.py
+============================
+Object storage abstraction layer for generating signed upload/download URLs.
+
+Supported providers (configured via STORAGE_PROVIDER in .env):
+  - 'supabase' : Supabase Storage (S3-compatible API)
+  - 's3'       : AWS S3 or any S3-compatible storage
+
+How the two-step signed upload works:
+  1. generate_upload_url() : Creates a pre-signed PUT URL with a short expiry.
+     The client uploads the file bytes directly to this URL using a PUT request.
+     The backend never handles raw file bytes — better performance and security.
+
+  2. generate_view_url()   : Creates a pre-signed GET URL so the client can
+     access a private file without exposing permanent credentials.
+
+Why not upload through the backend?
+  - Avoids bandwidth cost on the backend server.
+  - Faster for mobile clients (direct to CDN-edge storage).
+  - Reduces server memory usage.
+"""
+
+import threading
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+try:
+    import boto3
+    from botocore.client import Config
+except ImportError:
+    boto3 = None
+    Config = None
+
+from app.core.config import settings
+
+
+class StorageService:
+    """
+    Abstraction over object storage providers.
+    Generates signed URLs for uploads and downloads.
+    """
+
+    def __init__(self):
+        self._s3_client = None
+        self._lock = threading.Lock()
+
+    def warmup(self) -> None:
+        """Pre-warm S3 client in a background thread to prevent blocking event loop on first request."""
+        self._get_s3_client()
+
+    def _get_s3_client(self):
+        """
+        Lazily initialize the S3-compatible client thread-safely.
+
+        For Supabase: endpoint_url points to the Supabase S3 API.
+        Uses the dedicated Supabase S3 access key pair when configured.
+        For AWS S3: uses configured AWS credentials and region.
+        """
+        if self._s3_client is None:
+            with self._lock:
+                if self._s3_client is None:
+                    if boto3 is None or Config is None:
+                        raise ImportError(
+                            "The 'boto3' and 'botocore' libraries are required for S3 storage operations. "
+                            "Please install them via 'pip install boto3'."
+                        )
+                    if settings.storage_provider == "supabase":
+                        project_ref = settings.supabase_project_ref
+                        if not project_ref and settings.supabase_url:
+                            clean_url = (
+                                settings.supabase_url.replace("https://", "")
+                                .replace("http://", "")
+                                .rstrip("/")
+                            )
+                            host = clean_url.split("/")[0]
+                            if ".supabase.co" in host:
+                                project_ref = host.split(".supabase.co")[0]
+                            elif "." in host:
+                                project_ref = host.split(".")[0]
+                        access_key = settings.supabase_s3_access_key_id or project_ref
+                        secret_key = (
+                            settings.supabase_s3_secret_access_key
+                            or settings.supabase_service_role_key
+                        )
+                        endpoint = (
+                           
+                            f"https://{project_ref}.storage.supabase.co/storage/v1/s3"
+                            if project_ref
+                            else ""
+                        )
+                        self._s3_client = boto3.client(
+                            "s3",
+                            endpoint_url=endpoint or None,
+                            aws_access_key_id=access_key,
+                            aws_secret_access_key=secret_key,
+                            region_name="ap-southeast-2",
+                            config=Config(
+                                signature_version="s3v4",
+                                s3={"addressing_style": "path"},
+                            ),
+                        )
+                    else:
+                        # Standard AWS S3
+                        self._s3_client = boto3.client(
+                            "s3",
+                            aws_access_key_id=settings.aws_access_key_id,
+                            aws_secret_access_key=settings.aws_secret_access_key,
+                            region_name=settings.aws_region,
+                            config=Config(signature_version="s3v4"),
+                        )
+        return self._s3_client
+
+    def generate_upload_url(
+        self,
+        original_name: str,
+        mime_type: str,
+        entity_type: Optional[str] = None,
+        entity_id: Optional[uuid.UUID] = None,
+        user_id: Optional[uuid.UUID] = None,
+    ) -> tuple[str, str]:
+        """
+        Generate a pre-signed PUT URL for direct client upload.
+
+        Returns:
+            (upload_url, storage_path)
+            - upload_url   : The pre-signed URL the client should PUT to.
+            - storage_path : The object key (path) in the bucket, to be
+                             passed back in the confirm-upload step.
+        """
+        # Determine file extension safely from validated mime_type (Bug 4.1)
+        mime_to_ext = {
+            "image/jpeg": "jpg",
+            "image/jpg": "jpg",
+            "image/png": "png",
+            "image/webp": "webp",
+            "audio/mp4": "m4a",
+            "audio/m4a": "m4a",
+            "audio/mpeg": "mp3",
+            "audio/mp3": "mp3",
+            "audio/wav": "wav",
+            "audio/x-wav": "wav",
+            "audio/ogg": "ogg",
+            "audio/webm": "webm",
+            "application/pdf": "pdf",
+        }
+        mime_clean = mime_type.lower().strip()
+        if mime_clean in mime_to_ext:
+            file_ext = mime_to_ext[mime_clean]
+        else:
+            raw_ext = original_name.rsplit(".", 1)[-1].lower() if "." in original_name else "bin"
+            if raw_ext in ("html", "htm", "php", "js", "exe", "sh", "py", "phtml", "svg", "cgi"):
+                file_ext = "bin"
+            else:
+                file_ext = raw_ext
+
+        folder = entity_type or "misc"
+        file_uuid = uuid.uuid4()
+        user_prefix = f"{user_id}/" if user_id else ""
+        storage_path = f"{folder}/{user_prefix}{file_uuid}.{file_ext}"
+
+        client = self._get_s3_client()
+        upload_url = client.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={
+                "Bucket": settings.storage_bucket_name,
+                "Key": storage_path,
+                "ContentType": mime_type,
+            },
+            ExpiresIn=settings.storage_signed_url_expiry_seconds,
+        )
+        return upload_url, storage_path
+
+    def generate_view_url(self, storage_path: str) -> str:
+        """
+        Generate a short-lived pre-signed GET URL for viewing a private file.
+
+        The URL expires after `storage_signed_url_expiry_seconds` seconds.
+        """
+        client = self._get_s3_client()
+        return client.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={
+                "Bucket": settings.storage_bucket_name,
+                "Key": storage_path,
+            },
+            ExpiresIn=settings.storage_signed_url_expiry_seconds,
+        )
+
+    def _get_file_metadata_sync(self, storage_path: str) -> Optional[dict[str, Any]]:
+        try:
+            client = self._get_s3_client()
+            resp = client.head_object(
+                Bucket=settings.storage_bucket_name,
+                Key=storage_path,
+            )
+            return {
+                "content_length": resp.get("ContentLength", 0),
+                "content_type": resp.get("ContentType", ""),
+            }
+        except Exception:
+            return None
+
+    async def get_file_metadata(self, storage_path: str) -> Optional[dict[str, Any]]:
+        """Retrieve real object metadata (ContentLength, ContentType) from storage."""
+        import asyncio
+        return await asyncio.to_thread(self._get_file_metadata_sync, storage_path)
+
+    def _check_file_exists_sync(self, storage_path: str) -> bool:
+        meta = self._get_file_metadata_sync(storage_path)
+        return meta is not None
+
+    async def check_file_exists(self, storage_path: str) -> bool:
+        """
+        Non-blocking check if an object exists in storage via head_object,
+        executed in a worker thread pool so the event loop is never blocked.
+        """
+        import asyncio
+        return await asyncio.to_thread(self._check_file_exists_sync, storage_path)
+
+    def _get_file_bytes_sync(self, storage_path: str, bucket_name: Optional[str] = None) -> Optional[bytes]:
+        try:
+            client = self._get_s3_client()
+            bucket = bucket_name or settings.storage_bucket_name
+            resp = client.get_object(
+                Bucket=bucket,
+                Key=storage_path.lstrip("/"),
+            )
+            return resp["Body"].read()
+        except Exception:
+            return None
+
+    async def get_file_bytes(self, storage_path: str, bucket_name: Optional[str] = None) -> Optional[bytes]:
+        """Fetch raw bytes of a file from object storage."""
+        import asyncio
+        return await asyncio.to_thread(self._get_file_bytes_sync, storage_path, bucket_name)
+
+    def _delete_file_sync(self, storage_path: str, bucket_name: Optional[str] = None) -> bool:
+        try:
+            client = self._get_s3_client()
+            bucket = bucket_name or settings.storage_bucket_name
+            client.delete_object(
+                Bucket=bucket,
+                Key=storage_path.lstrip("/"),
+            )
+            return True
+        except Exception:
+            return False
+
+    async def delete_file(self, storage_path: str, bucket_name: Optional[str] = None) -> bool:
+        """
+        Delete a file from object storage (S3 / Supabase S3-compatible API).
+        Executed off-thread to avoid blocking the event loop.
+        """
+        import asyncio
+        return await asyncio.to_thread(self._delete_file_sync, storage_path, bucket_name)
+
+
+# Module-level singleton — one client per worker process
+storage_service = StorageService()
